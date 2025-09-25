@@ -17,14 +17,8 @@
 ## 获取脚本与执行
 
 ```bash
-# 1) 下载脚本（示例：raw.githubusercontent.com）
-wget -O install-anylink.sh https://raw.githubusercontent.com/forjustice/anylink-install/main/anylink-install.sh
+wget -O anylink-install.sh https://raw.githubusercontent.com/forjustice/anylink-install/main/anylink-install.sh && chmod +x anylink-install.sh && bash anylink-install.sh
 
-# 2) 赋予执行权限
-chmod +x anylink-install.sh
-
-# 3) 以 root 执行
-bash anylink-install.sh
 ```
 
 > 需要更详细的执行轨迹（调试）：
