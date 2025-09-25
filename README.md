@@ -1,4 +1,6 @@
-# AnyLink 一键安装脚本（Debian 12+）v3.5
+# AnyLink 一键安装脚本
+
+> 适用系统：**Debian 12/Ubuntu 22.04 或更高版本**（amd64/arm64）
 
 一键完成 **证书申请→ 下载并部署 AnyLink → 自动写配置 → 安装 systemd 服务 → 启动与校验** 的全流程；并内置：
 
@@ -9,8 +11,6 @@
 * 自动探测出口网卡并写入 `ipv4_master`
 * 自动修改 `profile.xml` 的 `<HostAddress>` → `域名:443`
 * 启动失败自动打印 `journalctl` 最近日志，便于定位
-
-> 适用系统：**Debian 12 或更高版本**（amd64/arm64）
 
 ---
 

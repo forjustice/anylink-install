@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# AnyLink One-Key Installer v3.5 — Debian 12+
-# - Auto-detect ipv4_master (eg. default route iface)
+# AnyLink Installer/Upgrader v3.7 — Debian 12+ / Ubuntu 22.04+
+# - Certificates fixed to /home/ssl/<domain>/{1.pem,1.key}
+# - Auto-detect ipv4_master (default route iface)
 # - Force-free ports 80/443/8800 (stop services / kill PIDs)
+# - Interactive menu: Install or Upgrade (only proceeds if newer release exists)
 
 [[ "${DEBUG:-0}" == "1" ]] && set -x
 set -euo pipefail
@@ -27,17 +29,28 @@ need(){
   fi
 }
 require_root(){ [[ $EUID -eq 0 ]] || { ERR "Please run as root."; exit 1; }; }
-require_debian12(){
+require_supported_os(){
   . /etc/os-release
-  if [[ "${ID:-}" != "debian" || "${VERSION_ID%%.*}" -lt 12 ]]; then
-    ERR "Debian 12+ is required (detected: ${ID:-?} ${VERSION_ID:-?})."
-    exit 1
-  fi
+  local id="${ID:-}" ver="${VERSION_ID:-0}"
+  case "$id" in
+    debian)
+      [[ "${ver%%.*}" -ge 12 ]] || { ERR "Debian 12+ required (detected: $id $ver)."; exit 1; }
+      ;;
+    ubuntu)
+      [[ "${ver%%.*}" -ge 22 ]] || { ERR "Ubuntu 22.04+ required (detected: $id $ver)."; exit 1; }
+      ;;
+    *)
+      # Best effort: allow Ubuntu-like via ID_LIKE if present
+      if [[ "${ID_LIKE:-}" =~ ubuntu ]]; then
+        [[ "${ver%%.*}" -ge 22 ]] || { ERR "Ubuntu 22.04+ derivative required (detected: $id $ver)."; exit 1; }
+      else
+        ERR "Unsupported distro: $id $ver. Only Debian 12+ or Ubuntu 22.04+ are supported."
+        exit 1
+      fi
+      ;;
+  esac
 }
-get_latest_tag(){
-  # Follow redirect to the concrete latest release URL and grab the last path segment (vX.Y.Z)
-  curl -fsSLI -o /dev/null -w '%{url_effective}\n' https://github.com/bjdgyc/anylink/releases/latest | awk -F/ '{print $NF}'
-}
+get_latest_tag(){ curl -fsSLI -o /dev/null -w '%{url_effective}\n' https://github.com/bjdgyc/anylink/releases/latest | awk -F/ '{print $NF}'; }
 map_arch(){
   case "$(dpkg --print-architecture)" in
     amd64) echo linux-amd64;;
@@ -54,15 +67,30 @@ toml_set(){
   fi
 }
 detect_iface(){
-  # Prefer interface from default route, fallback to route to 1.1.1.1, else eth0
   local dev
   dev="$(ip -4 route show default 2>/dev/null | awk '/default/ {print $5; exit}')"
   [[ -n "$dev" ]] || dev="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
   [[ -n "$dev" ]] || dev="eth0"
   echo "$dev"
 }
+ver_to_plain(){ sed -E 's/^v//' <<<"$1"; }
+is_newer(){
+  # return 0 if $1 > $2 (semver-ish), else 1
+  [[ "$(printf '%s\n' "$(ver_to_plain "$1")" "$(ver_to_plain "$2")" | sort -V | tail -n1)" == "$(ver_to_plain "$1")" && "$(ver_to_plain "$1")" != "$(ver_to_plain "$2")" ]]
+}
+get_installed_version(){
+  local v=""
+  if [[ -f "$ANYLINK_DIR/version_info" ]]; then
+    v="$(head -n1 "$ANYLINK_DIR/version_info" | grep -Eo 'v?[0-9]+\.[0-9]+\.[0-9]+' || true)"
+  fi
+  if [[ -z "$v" && -x "$ANYLINK_DIR/anylink" ]]; then
+    v="$("$ANYLINK_DIR/anylink" --version 2>/dev/null | grep -Eo 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+    [[ -n "$v" ]] || v="$("$ANYLINK_DIR/anylink" version 2>/dev/null | grep -Eo 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+  fi
+  echo "${v:-unknown}"
+}
 
-# ---------- Force-free ports ----------
+# ---------- Ports ----------
 _stop_guess_service(){
   local comm="$1"
   for svc in "$comm" "${comm}.service" nginx apache2 caddy haproxy docker-proxy anylink; do
@@ -106,7 +134,7 @@ force_free_port(){
 }
 force_free_ports(){ for p in 80 443 8800; do force_free_port "$p"; done; }
 
-# ---------- Detect existing install / uninstall ----------
+# ---------- Install detection / uninstall ----------
 already_installed(){
   [[ -x "$ANYLINK_DIR/anylink" ]] && return 0
   systemctl list-unit-files | grep -q "^${SERVICE}" && return 0
@@ -123,8 +151,8 @@ uninstall_all(){
   OK "Uninstall complete."
 }
 
-# ---------- 0: Dependencies & baseline ----------
-precheck(){
+# ---------- Baseline deps ----------
+ensure_deps(){
   STEP "0" "Checking/installing dependencies"
   need curl curl
   need wget wget
@@ -136,18 +164,11 @@ precheck(){
   need ss iproute2
   need iptables iptables
   need xmlstarlet xmlstarlet
+  need update-ca-certificates ca-certificates
   update-ca-certificates || true
-
-  STEP "0" "Checking existing AnyLink installation"
-  if already_installed; then
-    read -rp "AnyLink appears installed. Uninstall it before continuing? [y/N]: " a; a="${a:-N}"
-    [[ "$a" =~ ^[Yy]$ ]] || { ERR "User chose not to uninstall. Aborting."; exit 1; }
-    uninstall_all
-  else
-    OK "No existing AnyLink installation found."
-  fi
 }
 
+# ---------- Network baseline (used by Install) ----------
 pre_network(){
   STEP "0" "Network/kernel preparation"
   force_free_ports
@@ -160,7 +181,7 @@ pre_network(){
   [[ -c /dev/net/tun ]] || WARN "/dev/net/tun not found. If AnyLink fails, run: modprobe tun && echo tun >/etc/modules-load.d/tun.conf"
 }
 
-# ---------- 1: Certificates (fixed 1.pem / 1.key) ----------
+# ---------- Certificates (Install flow) ----------
 prompt_domain(){
   STEP "1" "Domain"
   read -rp "Enter your domain already pointing to this host (used for 443/8800): " DOMAIN
@@ -168,7 +189,6 @@ prompt_domain(){
   echo "$DOMAIN" > /tmp/.anylink_domain
   OK "Domain: $DOMAIN"
 }
-
 apply_cert(){
   STEP "1.1" "Issue SSL certificate (domainSSL)"
   printf '%s\n' "$DOMAIN" | bash <(curl -s -L git.io/dmSSL)
@@ -176,7 +196,6 @@ apply_cert(){
   [[ -d "$CERT_DIR" ]] || { ERR "Certificate directory not found: $CERT_DIR"; exit 1; }
   OK "Certificate directory: $CERT_DIR"
 }
-
 pick_cert(){
   STEP "1.2" "Locate certificate files (fixed names)"
   CERT_FILE="$CERT_DIR/1.pem"
@@ -185,7 +204,6 @@ pick_cert(){
   OK "Certificate: $CERT_FILE"
   OK "Private key: $KEY_FILE"
 }
-
 verify_cert(){
   STEP "1.3" "Verify certificate (openssl)"
   if ! openssl x509 -in "$CERT_FILE" -noout -subject -issuer -dates >/tmp/.certinfo 2>&1; then
@@ -197,7 +215,7 @@ verify_cert(){
   OK "Certificate looks valid. Proceeding."
 }
 
-# ---------- 2/3: Download & extract AnyLink ----------
+# ---------- Download & extract ----------
 download_anylink(){
   STEP "2" "Download AnyLink (latest release)"
   TAG="$(get_latest_tag)"; VER="${TAG#v}"; ARCH="$(map_arch)"
@@ -212,7 +230,7 @@ download_anylink(){
   OK "Extraction complete: $ANYLINK_DIR"
 }
 
-# ---------- 4/5: Generate password hash & JWT secret ----------
+# ---------- Secrets (Install flow) ----------
 gen_secrets(){
   STEP "4" "Generate admin password hash"
   PASS_HASH="$("$ANYLINK_DIR/anylink" tool -p "$ADMIN_PLAIN_PASS" | sed -n 's/^Passwd://p' | tr -d '[:space:]')"
@@ -227,7 +245,7 @@ gen_secrets(){
   echo "  jwt_secret (masked): ${JWT_SECRET:0:8}...${JWT_SECRET: -6}"
 }
 
-# ---------- 6/7/8: Write config (server.toml + profile.xml) ----------
+# ---------- Configs (Install flow) ----------
 write_conf(){
   STEP "6" "Prepare conf directory & copy template"
   cd "$ANYLINK_DIR/conf"
@@ -252,9 +270,7 @@ write_conf(){
   # profile.xml: keep exactly ONE <HostEntry> with VPN / <domain>:443
   if [[ -f profile.xml ]]; then
     cp -a profile.xml "profile.xml.bak.$(date +%F-%H%M%S)"
-    # Remove ALL HostEntry nodes
     xmlstarlet ed -P -L -d '//HostEntry' profile.xml
-    # Add a single HostEntry at document root, then add children HostName and HostAddress
     xmlstarlet ed -P -L \
       -s '/*' -t elem -n 'HostEntry' -v '' \
       -s '(//HostEntry)[1]' -t elem -n 'HostName' -v 'VPN' \
@@ -268,7 +284,7 @@ write_conf(){
   OK "server.toml / profile.xml updated."
 }
 
-# ---------- 9: systemd install ----------
+# ---------- systemd ----------
 install_service(){
   STEP "9" "Install systemd unit and enable on boot"
   local SRC=""
@@ -279,7 +295,6 @@ install_service(){
   mkdir -p "$SYSTEMD_DIR"
   cp -f "$SRC" "$SYSTEMD_DIR/$SERVICE"
 
-  # Ensure PATH for the unit (iptables and others may be in /usr/sbin)
   if ! grep -q '^Environment=PATH=' "$SYSTEMD_DIR/$SERVICE"; then
     sed -i '/^\[Service\]/a Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin' "$SYSTEMD_DIR/$SERVICE"
   fi
@@ -289,7 +304,6 @@ install_service(){
   OK "Enabled: $SERVICE"
 }
 
-# ---------- 10: start & verify ----------
 start_and_verify(){
   STEP "10" "Start AnyLink"
   systemctl start "$SERVICE" || true
@@ -311,11 +325,11 @@ start_and_verify(){
   OK "Service is active."
 }
 
-# ---------- 11: summary ----------
 summary(){
   STEP "11" "Admin panel"
-  DOMAIN="$(cat /tmp/.anylink_domain)"
-  echo "  URL: https://${DOMAIN}:8800"
+  local d="${DOMAIN:-$(cat /tmp/.anylink_domain 2>/dev/null || true)}"
+  [[ -n "$d" ]] || d="your-domain"
+  echo "  URL: https://${d}:8800"
   echo "  User: admin"
   echo "  Pass: ${ADMIN_PLAIN_PASS}"
   echo
@@ -324,34 +338,111 @@ summary(){
   echo "  systemctl status anylink    # status"
 }
 
-# ----------------- Main flow -----------------
+# ---------- Upgrade flow ----------
+upgrade_anylink(){
+  STEP "U" "Upgrade AnyLink (check for newer release)"
+  if ! already_installed; then
+    ERR "AnyLink is not installed at $ANYLINK_DIR. Please run Install."
+    exit 1
+  fi
+  local INSTALLED LATEST TAG ARCH PKG URL
+  INSTALLED="$(get_installed_version)"
+  if [[ "$INSTALLED" == "unknown" ]]; then
+    WARN "Installed version could not be detected; will proceed if a newer tag exists."
+  else
+    OK "Installed version: $INSTALLED"
+  fi
+  TAG="$(get_latest_tag)"; LATEST="${TAG#v}"
+  OK "Latest release tag: $TAG"
+
+  if [[ "$INSTALLED" != "unknown" ]] && ! is_newer "$TAG" "$INSTALLED"; then
+    OK "You already have the latest version (no upgrade needed)."
+    return 0
+  fi
+
+  read -rp "Proceed to upgrade from ${INSTALLED} to ${TAG}? [y/N]: " ans
+  ans="${ans:-N}"
+  [[ "$ans" =~ ^[Yy]$ ]] || { ERR "Upgrade cancelled by user."; exit 1; }
+
+  systemctl stop "$SERVICE" 2>/dev/null || true
+
+  local TS BAKDIR
+  TS="$(date +%F-%H%M%S)"
+  BAKDIR="$ANYLINK_DIR/conf.bak.$TS"
+  mkdir -p "$BAKDIR"
+  if [[ -d "$ANYLINK_DIR/conf" ]]; then
+    cp -a "$ANYLINK_DIR/conf/"* "$BAKDIR/" || true
+    OK "Backed up conf to: $BAKDIR"
+  fi
+
+  ARCH="$(map_arch)"
+  PKG="anylink-${LATEST}-${ARCH}.tar.gz"
+  URL="https://github.com/bjdgyc/anylink/releases/download/${TAG}/${PKG}"
+  TMPD="$(mktemp -d)"; trap '[[ -n "${TMPD:-}" ]] && rm -rf "$TMPD"' RETURN
+  STEP "U" "Downloading $PKG"
+  (cd "$TMPD" && wget -q --show-progress "$URL")
+  STEP "U" "Extracting to /usr/local (in-place upgrade)"
+  tar -xzvf "$TMPD/$PKG" -C /usr/local/
+
+  # Restore configs just in case
+  [[ -f "$BAKDIR/server.toml" ]] && cp -f "$BAKDIR/server.toml" "$ANYLINK_DIR/conf/server.toml"
+  [[ -f "$BAKDIR/profile.xml" ]] && cp -f "$BAKDIR/profile.xml" "$ANYLINK_DIR/conf/profile.xml"
+
+  install_service
+  start_and_verify
+
+  local NEWVER
+  NEWVER="$(get_installed_version)"
+  OK "Upgrade complete. Current version: ${NEWVER}"
+}
+
+# ---------- Install flow ----------
+install_flow(){
+  ensure_deps
+
+  STEP "0" "Existing installation check"
+  if already_installed; then
+    read -rp "AnyLink appears installed. Uninstall it before continuing? [y/N]: " a; a="${a:-N}"
+    [[ "$a" =~ ^[Yy]$ ]] || { ERR "User chose not to uninstall. Aborting."; exit 1; }
+    uninstall_all
+  else
+    OK "No existing AnyLink installation found."
+  fi
+
+  pre_network
+
+  prompt_domain
+  apply_cert
+  pick_cert
+  verify_cert
+
+  download_anylink
+  gen_secrets
+  write_conf
+  install_service
+  start_and_verify
+  summary
+}
+
+# ---------- Menu ----------
+main_menu(){
+  echo "======================================================"
+  echo " AnyLink Installer/Upgrader v3.7 (Debian 12+ / Ubuntu 22.04+)"
+  echo "======================================================"
+  echo " 1) Install (fresh deploy)"
+  echo " 2) Upgrade (if newer version exists)"
+  echo " 3) Exit"
+  echo "------------------------------------------------------"
+  read -rp "Choose an option [1-3]: " choice
+  case "${choice:-}" in
+    1) install_flow ;;
+    2) ensure_deps; upgrade_anylink; summary ;;
+    3) echo "Bye."; exit 0 ;;
+    *) ERR "Invalid choice."; exit 1 ;;
+  esac
+}
+
+# ----------------- Entry -----------------
 require_root
-require_debian12
-
-# 0. deps & baseline
-precheck
-pre_network
-
-# 1. certificates (fixed 1.pem/1.key)
-prompt_domain
-apply_cert
-pick_cert
-verify_cert
-
-# 2/3. download & extract
-download_anylink
-
-# 4/5. secrets
-gen_secrets
-
-# 6/7/8. configs (server.toml + profile.xml)
-write_conf
-
-# 9. systemd
-install_service
-
-# 10. start & verify
-start_and_verify
-
-# 11. summary
-summary
+require_supported_os
+main_menu
